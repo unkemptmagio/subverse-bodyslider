@@ -3,6 +3,9 @@
 //! and the renderer reads these matrices every frame, so changes show up live.
 //! The Lua mod writes `cmd.txt` (full state); a worker thread here applies it whenever it changes.
 //! Line format: `<mesh_addr_hex> <num_bones> <pivot_bone> <scale> <bone> <bone> ...`
+//!   scale `s`        : uniform, about the pivot bone's bind origin (volume sliders)
+//!   scale `sx,sy,sz` : along the pivot bone's own axes, about its origin (thickness, nipple length, ...)
+//! Lines stack: a bone listed twice gets both scales (e.g. breast size + nipple length).
 // ponytail: file polling (100ms) instead of an IPC channel; no Windows crates, raw kernel32 FFI.
 
 use std::collections::HashMap;
@@ -56,17 +59,39 @@ fn find_inv_array(mesh: usize, n: usize) -> Option<usize> {
     })
 }
 
-/// Bind-pose component-space origin of the bone whose inverse bind matrix is `m`.
-fn pivot_of(m: &Mat) -> [f32; 3] {
-    // m = inverse(Ref); Ref origin p satisfies p*R + t = 0  ->  p = -t * R^-1
+fn inv3(m: &Mat) -> [[f32; 3]; 3] {
     let r = [[m[0], m[1], m[2]], [m[4], m[5], m[6]], [m[8], m[9], m[10]]];
     let det = r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1]) - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
         + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]);
-    let inv = [
+    [
         [(r[1][1] * r[2][2] - r[1][2] * r[2][1]) / det, (r[0][2] * r[2][1] - r[0][1] * r[2][2]) / det, (r[0][1] * r[1][2] - r[0][2] * r[1][1]) / det],
         [(r[1][2] * r[2][0] - r[1][0] * r[2][2]) / det, (r[0][0] * r[2][2] - r[0][2] * r[2][0]) / det, (r[0][2] * r[1][0] - r[0][0] * r[1][2]) / det],
         [(r[1][0] * r[2][1] - r[1][1] * r[2][0]) / det, (r[0][1] * r[2][0] - r[0][0] * r[2][1]) / det, (r[0][0] * r[1][1] - r[0][1] * r[1][0]) / det],
-    ];
+    ]
+}
+
+fn mul(a: &Mat, b: &Mat) -> Mat {
+    let mut o = [0.0; 16];
+    for r in 0..4 { for c in 0..4 { o[r * 4 + c] = (0..4).map(|k| a[r * 4 + k] * b[k * 4 + c]).sum(); } }
+    o
+}
+
+/// Sc = P * D * P^-1 (P = the pivot bone's inverse bind matrix): scales by d along that bone's own axes, about its origin.
+fn axis_scaler(p: &Mat, d: [f32; 3]) -> Mat {
+    let mut pd = *p;
+    for r in 0..4 { for c in 0..3 { pd[r * 4 + c] *= d[c]; } }
+    let ri = inv3(p);
+    let mut pinv = [0.0f32; 16];
+    for r in 0..3 { for c in 0..3 { pinv[r * 4 + c] = ri[r][c]; } }
+    for c in 0..3 { pinv[12 + c] = -(p[12] * ri[0][c] + p[13] * ri[1][c] + p[14] * ri[2][c]); }
+    pinv[15] = 1.0;
+    mul(&pd, &pinv)
+}
+
+/// Bind-pose component-space origin of the bone whose inverse bind matrix is `m`.
+fn pivot_of(m: &Mat) -> [f32; 3] {
+    // m = inverse(Ref); Ref origin p satisfies p*R + t = 0  ->  p = -t * R^-1
+    let inv = inv3(m);
     let t = [m[12], m[13], m[14]];
     let mut p = [0.0; 3];
     for c in 0..3 { p[c] = -(t[0] * inv[0][c] + t[1] * inv[1][c] + t[2] * inv[2][c]); }
@@ -98,17 +123,19 @@ impl State {
         for line in text.lines() {
             let f: Vec<&str> = line.split_whitespace().collect();
             if f.len() < 5 { continue; }
-            let (Ok(mesh), Ok(n), Ok(pivot), Ok(s)) = (
-                usize::from_str_radix(f[0].trim_start_matches("0x"), 16), f[1].parse::<usize>(),
-                f[2].parse::<usize>(), f[3].parse::<f32>()) else { continue };
-            if !(0.2..=6.0).contains(&s) || pivot >= n { continue; }
+            let (Ok(mesh), Ok(n), Ok(pivot)) = (
+                usize::from_str_radix(f[0].trim_start_matches("0x"), 16), f[1].parse::<usize>(), f[2].parse::<usize>()) else { continue };
+            let s: Vec<f32> = f[3].split(',').filter_map(|x| x.parse().ok()).collect();
+            if !(s.len() == 1 || s.len() == 3) || s.iter().any(|v| !(0.2..=6.0).contains(v)) || pivot >= n { continue; }
             // ponytail: re-find every apply (only runs when cmd.txt changes); a cached ptr can go stale
             let Some(arr) = find_inv_array(mesh, n) else { continue };
             let mats = unsafe { std::slice::from_raw_parts(arr as *const Mat, n) };
-            let p = pivot_of(&self.original(arr, pivot, &mats[pivot]));
+            let po = self.original(arr, pivot, &mats[pivot]);
+            let (p, axes) = (pivot_of(&po), (s.len() == 3).then(|| axis_scaler(&po, [s[0], s[1], s[2]])));
             for b in f[4..].iter().filter_map(|x| x.parse::<usize>().ok()).filter(|&b| b < n) {
                 let o = self.original(arr, b, &mats[b]);
-                want.insert((arr, b), scaled(&o, p, s));
+                let cur = *want.get(&(arr, b)).unwrap_or(&o);  // stack on earlier lines for this bone
+                want.insert((arr, b), match &axes { Some(sc) => mul(sc, &cur), None => scaled(&cur, p, s[0]) });
             }
         }
         // keep history of meshes that left the list (an asset can come back still scaled), but never write to them
@@ -195,5 +222,18 @@ mod tests {
         assert!((len(a) - 2.0).abs() < 1e-4 && (len(b) - 3.0).abs() < 1e-4, "{a:?} {b:?}");
         // pivot itself never moves
         assert!(len(xf(p, &scaled(&m, p, s))) < 1e-4);
+    }
+    #[test]
+    fn axis_scale() {
+        // the bone's local X axis points along model +Y here (R row 0 = (0,1,0)), local Y along model -X
+        let m = inv_ref();
+        let sc = axis_scaler(&m, [2.0, 1.0, 1.0]);
+        let len = |q: [f32; 3]| (q[0] * q[0] + q[1] * q[1] + q[2] * q[2]).sqrt();
+        let along_x = xf([10.0, 22.0, 30.0], &mul(&sc, &m));  // 2 units along local X -> 4
+        let along_y = xf([8.0, 20.0, 30.0], &mul(&sc, &m));   // 2 units along local Y -> stays 2
+        assert!((len(along_x) - 4.0).abs() < 1e-4 && (len(along_y) - 2.0).abs() < 1e-4, "{along_x:?} {along_y:?}");
+        // uniform axis scale == the old pivot scale
+        let (a, b) = (mul(&axis_scaler(&m, [1.5; 3]), &m), scaled(&m, pivot_of(&m), 1.5));
+        assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-4));
     }
 }

@@ -1,17 +1,32 @@
 -- BodySlider (UE4SS Lua side): finds heroine meshes, keeps per-character slider values (saved to BodySlider.ini),
 -- writes cmd.txt for bodyslider.dll which rescales the bones live.
 -- Keys: Num7/Num9 select previous/next character on screen, Num8/Num2 breasts +/-, Num6/Num4 butt +/-,
---       Num5 reset selected character, Num0 or F8 show/hide the on-screen sliders. Size limits: [limits] in BodySlider.ini.
+--       Num5 reset selected character, Num0 or F8 show/hide the on-screen sliders, F10 hide it for screenshots.
+--       Size limits: [limits] in BodySlider.ini. Presets 1-3 (panel) are shared by all characters.
 
 local STEP = 0.1
--- per-slider limits in volume; overridden by [limits] in BodySlider.ini (clamped to 0.1-50 so the dll stays sane)
-local MIN = { breast = 1.0, butt = 1.0 }
-local MAX = { breast = 3.0, butt = 5.0 }
-local SLIDERS = { "breast", "butt" }
-local GROUPS = {
+local FINE = { hips = 0.02, waist = 0.02, nipple = 0.05, areola = 0.05 }  -- smaller slider steps
+-- per-slider limits; overridden by [limits] in BodySlider.ini (clamped to 0.1-50, the dll accepts 0.2-6 per axis)
+local MIN = { breast = 1.0, butt = 1.0, thighs = 0.7, hips = 0.85, waist = 0.8, nipple = 0.5, areola = 0.5 }
+local MAX = { breast = 3.0, butt = 5.0, thighs = 1.6, hips = 1.25, waist = 1.15, nipple = 2.0, areola = 2.0 }
+local SLIDERS = { "breast", "butt", "thighs", "hips", "waist", "nipple", "areola" }
+local GROUPS = {  -- pivot bones; each scales together with its descendants unless ALONE
     breast = { "Breast1_L", "Breast1_R", "Cloth_Breast1_L", "Cloth_Breast1_R" },
     butt   = { "Helper_Skin_Butt_Base_L", "Helper_Skin_Butt_Base_R" },
+    thighs = { "Helper_Skin_Thigh_L", "Helper_Skin_Thigh_R", "Helper_Skin_Quad_L", "Helper_Skin_Quad_R",
+               "Helper_Cloth_Thigh_L", "Helper_Cloth_Thigh_R", "Helper_Cloth_Quad_L", "Helper_Cloth_Quad_R" },
+    hips   = { "Helper_Skin_Hips", "Helper_Cloth_Hips" },
+    waist  = { "Helper_Skin_Spine", "Helper_Skin_Spine1", "Helper_Cloth_Spine", "Helper_Cloth_Spine1" },
+    nipple = { "Breast6_L", "Breast6_R", "Cloth_Breast6_L", "Cloth_Breast6_R" },   -- 6+7: last ~1 cm of the breast
+    areola = { "Breast5_L", "Breast5_R", "Cloth_Breast5_L", "Cloth_Breast5_R" },   -- 5-7: ~2.5 cm around the tip
 }
+-- per-axis sliders (in the pivot bone's own frame; others are volume, scaled in 3 axes): "v" = the slider value.
+-- Biped helpers: X across the body, Y down the leg/spine, Z front-back. Breast chain: Y points out through the nipple.
+local AXES = {
+    thighs = { "v", 1, "v" }, hips = { "v", 1, 1 }, waist = { "v", 1, "v" },
+    nipple = { 1, "v", 1 }, areola = { "v", 1, "v" },
+}
+local ALONE = { hips = true }  -- Helper_Skin_Hips parents the genital bones: don't widen those with the hips
 
 local function log(s) print("[BodySlider] " .. tostring(s) .. "\n") end
 
@@ -55,7 +70,8 @@ local function save()
     local chars = {}
     for c in pairs(vals) do chars[#chars + 1] = c end
     table.sort(chars)
-    local out = { "; BodySlider. Sizes are volume (1.0 = default, 2.0 = twice as big).",
+    local out = { "; BodySlider. 1.0 = default. breast/butt are volume (2.0 = twice as big); the others scale width or length.",
+                  "; [preset1]-[preset3] are the panel presets, shared by all characters.",
                   "; [limits] sets each slider's range (0.1 - 50); edit with the game closed.", "[limits]" }
     for _, sl in ipairs(SLIDERS) do
         out[#out + 1] = string.format("%s_min=%g", sl, MIN[sl]); out[#out + 1] = string.format("%s_max=%g", sl, MAX[sl])
@@ -106,7 +122,7 @@ local function buildLayout(comp)
         L.slider[slider] = {}
         for _, pv in ipairs(pivots) do
             local pi = index[pv]
-            if pi then L.slider[slider][pi] = descendantsOf(pi) end
+            if pi then L.slider[slider][pi] = ALONE[slider] and { pi } or descendantsOf(pi) end
         end
     end
     return L
@@ -144,9 +160,17 @@ local function rescan()
             for slider, pivots in pairs(L.slider) do
                 local s = get(char, slider)
                 -- every live mesh is listed, 1.0 too: the dll only touches meshes in this list (resets to 1.0 included)
-                for pi, bones in pairs(pivots) do
+                local scale
+                if AXES[slider] then
+                    local a = {}
+                    for i, v in ipairs(AXES[slider]) do a[i] = string.format("%.4f", v == "v" and s or v) end
+                    scale = table.concat(a, ",")
+                else
                     -- slider = volume: bones scale in 3 axes, so length scale is the cube root (2.0x = twice the volume)
-                    lines[#lines + 1] = string.format("%x %d %d %.4f %s", addr, L.n, pi, s ^ (1 / 3), table.concat(bones, " "))
+                    scale = string.format("%.4f", s ^ (1 / 3))
+                end
+                for pi, bones in pairs(pivots) do
+                    lines[#lines + 1] = string.format("%x %d %d %s %s", addr, L.n, pi, scale, table.concat(bones, " "))
                 end
             end
         end)
@@ -207,13 +231,15 @@ end)
 
 ---------------------------------------------------------------- on-screen panel (reuses the game's Options slider widget)
 local SLIDER_CLASS = "/Game/Core/UI/Settings/SliderOption.SliderOption_C"
-local LABELS = { breast = "Breasts", butt = "Butt" }
+local LABELS = { breast = "Breasts", butt = "Butt", thighs = "Thighs", hips = "Hips", waist = "Waist",
+                 nipple = "Nipples", areola = "Areolas" }
 local panel = {}          -- slider name -> { slider, value label, raw = last raw value we set/read }
 local panelOn = false  -- Num0 opens it
+local hidden = false   -- F10: hide for screenshots
 local dirty = false
 
 local function toRaw(v, s) return (v - MIN[s]) / (MAX[s] - MIN[s]) end
-local function fromRaw(r, s) return math.floor((MIN[s] + r * (MAX[s] - MIN[s])) / STEP + 0.5) * STEP end  -- snap to STEP
+local function fromRaw(r, s) local st = FINE[s] or STEP; return math.floor((MIN[s] + r * (MAX[s] - MIN[s])) / st + 0.5) * st end  -- snap to STEP
 
 local function valid(o) return o and o:IsValid() end
 
@@ -264,7 +290,8 @@ local TEX_WHITE = "/Game/ArtAssets/Shared/Interface/Textures/UI_BlankWhite_BC"
 local BOX    = { R = 0.06, G = 0.02, B = 0.13, A = 0.96 }
 local FRAME  = { R = 0.55, G = 0.20, B = 0.85, A = 1.0 }
 local ACCENT = { R = 1.0,  G = 0.22, B = 0.80, A = 1.0 }
-local BW, BH, PAD = 560, 244, 24
+local ROWH = 46
+local BW, BH, PAD = 560, 80 + 7 * 46 + 8 + 46 + 50, 24  -- header, slider rows, preset row, footer
 local ui = {}
 
 local function construct(clsPath, outer) return StaticConstructObject(StaticFindObject(clsPath), outer) end
@@ -327,7 +354,7 @@ local function buildUI()
     if not (valid(cls) and valid(pc) and valid(lib) and valid(layoutLib)) then return false end
     local vp, scale = layoutLib:GetViewportSize(pc), layoutLib:GetViewportScale(pc)
     local W, H = vp.X / scale, vp.Y / scale   -- slate units
-    local x0, y0 = math.floor(W * 0.04), math.floor(H * 0.32)
+    local x0, y0 = math.floor(W * 0.04), math.max(8, math.floor((H - BH) / 2))
 
     local host = lib:Create(pc, cls, pc)
     if not valid(host) then return false end
@@ -349,7 +376,7 @@ local function buildUI()
         if not valid(w) then return false end
         styleSlider(w)
         font = font or w.TextBlock_Description.Font
-        local sl, y = w.Slider, y0 + 84 + (i - 1) * 52
+        local sl, y = w.Slider, y0 + 80 + (i - 1) * ROWH
         sl:RemoveFromParent()
         place(canvas, sl, x0 + PAD + 120, y + 4, BW - 2 * PAD - 200, 28)
         try("colors", function() sl:SetSliderBarColor(WHITE); sl:SetSliderHandleColor(WHITE) end)
@@ -364,6 +391,13 @@ local function buildUI()
     ui.next = button(tree, canvas, white, font, ">", x0 + PAD + 52, y0 + BH - 46, 44, 34)
     ui.hint  = label(tree, canvas, font, 12, LILAC,  x0 + PAD + 108, y0 + BH - 38, 120, 20)
     setText(ui.hint, "CHARACTER")
+    -- presets: click a number to load it into this character; SAVE then a number stores her current shape there
+    local py = y0 + 80 + #SLIDERS * ROWH + 8
+    rect(tree, canvas, white, FRAME, x0 + PAD, py - 6, BW - 2 * PAD, 1)
+    setText(label(tree, canvas, font, 14, LILAC, x0 + PAD, py + 8, 100, 22), "PRESET")
+    ui.presets = {}
+    for i = 1, 3 do ui.presets[i] = button(tree, canvas, white, font, tostring(i), x0 + PAD + 108 + (i - 1) * 54, py, 46, 34) end
+    ui.save = button(tree, canvas, white, font, "SAVE", x0 + PAD + 108 + 3 * 54 + 8, py, 90, 34)
     -- buttons are toggle CheckBoxes: pollPanel sees them checked, acts, and unchecks (no Lua click delegates here)
     ui.reset = button(tree, canvas, white, font, "RESET", x0 + BW - PAD - 216, y0 + BH - 46, 100, 34)
     ui.close = button(tree, canvas, white, font, "CLOSE", x0 + BW - PAD - 100, y0 + BH - 46, 100, 34)
@@ -376,7 +410,7 @@ end
 local function uiAlive() return valid(ui.host) and ui.host:IsInViewport() and panel.breast and valid(panel.breast.slider) end
 
 local function pollPanel()
-    local show = panelOn and selected ~= nil
+    local show = panelOn and not hidden and selected ~= nil
     if not uiAlive() then
         if not show then return end
         if not buildUI() then return end
@@ -387,6 +421,21 @@ local function pollPanel()
     if clicked(ui.reset) then vals[selected] = nil; dirty = true; rescan() end
     if clicked(ui.prev) then cycle(-1) end
     if clicked(ui.next) then cycle(1) end
+    -- SAVE stays lit until a number is clicked (or SAVE again); a number alone loads
+    for i, b in ipairs(ui.presets) do
+        if clicked(b) then
+            local key = "preset" .. i
+            if ui.save:IsChecked() then
+                vals[key] = {}
+                for _, s in ipairs(SLIDERS) do vals[key][s] = get(selected, s) end
+                ui.save:SetIsChecked(false)
+            else
+                vals[selected] = {}
+                for _, s in ipairs(SLIDERS) do vals[selected][s] = (vals[key] or {})[s] end
+            end
+            dirty = true; rescan()
+        end
+    end
     setText(ui.title, "BODY  |  " .. selected:upper())
     for _, s in ipairs(SLIDERS) do
         local p, slider = panel[s], panel[s].slider
@@ -400,12 +449,13 @@ local function pollPanel()
         local want = toRaw(get(selected, s), s)
         if math.abs(slider:GetValue() - want) > 1e-3 then slider:SetValue(want) end
         p.raw = slider:GetValue()
-        setText(p.value, string.format("%.1fx", get(selected, s)))
+        setText(p.value, string.format(FINE[s] and "%.2fx" or "%.1fx", get(selected, s)))
     end
 end
 
 RegisterKeyBind(Key.NUM_ZERO, function() panelOn = not panelOn end)
 RegisterKeyBind(Key.F8, function() panelOn = not panelOn end)  -- for keyboards without a numpad
+RegisterKeyBind(Key.F10, function() hidden = not hidden end)    -- same key as FreeCam's hide-UI
 
 -- Game-thread timers. (LoopAsync + ExecuteInGameThread every 100ms corrupted UE4SS's callback registry.)
 local lastPanelErr

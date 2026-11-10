@@ -1,8 +1,8 @@
 # BodySlider for Subverse
 
-Live breast / butt size sliders for Subverse, saved per character. Changes show instantly in the Pandora menu, scenes and the gallery.
+Live body sliders for Subverse (breasts, butt, thighs, hips, waist, nipples, areolas), saved per character, with 3 shared presets. Changes show instantly in the Pandora menu, scenes and the gallery.
 
-Nexus Mods: *link coming soon*
+Nexus Mods: https://www.nexusmods.com/subverse/mods/25
 
 ## Requirements
 - Subverse (tested on GOG v1.2 + Celestina DLC)
@@ -16,12 +16,14 @@ Download the zip from [Releases](../../releases) and copy the `BodySlider` folde
 | Input | Action |
 |---|---|
 | Num0 / F8 | Open / close the slider panel |
-| Drag sliders | Size as volume (2.0 = twice as big), 0.1 steps |
+| Drag sliders | Breasts/butt: volume (2.0 = twice as big). Thighs, hips, waist, nipples, areolas: width or length |
 | `<` / `>` | Switch character when several are on screen |
 | RESET | Back to default for that character |
+| PRESET 1-3 | Click a number to load it; SAVE then a number stores the current shape (shared by all characters) |
+| F10 | Hide the panel for screenshots |
 | Numpad 8/2, 6/4, 7/9, 5 | Breasts, butt, switch character, reset |
 
-Slider ranges are set in `BodySlider.ini` (`[limits]`: `breast_min`, `breast_max`, `butt_min`, `butt_max`, 0.1–50).
+Slider ranges are set in `BodySlider.ini` (`[limits]`: `<slider>_min` / `<slider>_max`, 0.1–50; the DLL clamps each axis to 0.2–6).
 
 ## How it works
 - `lua/main.lua` (UE4SS): finds heroine skeletal meshes, keeps per-character values, draws the panel (reusing the game's own UI widgets), and writes the wanted bone scales to `cmd.txt`.
