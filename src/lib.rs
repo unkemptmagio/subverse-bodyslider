@@ -5,7 +5,12 @@
 //! Line format: `<mesh_addr_hex> <num_bones> <pivot_bone> <scale> <bone> <bone> ...`
 //!   scale `s`        : uniform, about the pivot bone's bind origin (volume sliders)
 //!   scale `sx,sy,sz` : along the pivot bone's own axes, about its origin (thickness, nipple length, ...)
-//! Lines stack: a bone listed twice gets both scales (e.g. breast size + nipple length).
+//!   `c<rx>,<ry>,<rz>,<tx>,<ty>,<tz>` : rotate (degrees, about model X,Y,Z through the pivot's bind origin), then
+//!                                     move (cm, model axes). Model: +X = character's left, +Y = front, +Z = up.
+//!   `y<deg>,<cap_bone>` : lift without turning the tip: each listed bone moves straight up by
+//!                          (its forward distance from the pivot, capped at cap_bone's) * tan(deg),
+//!                          so the chain bends and everything past cap_bone (areola, nipple) moves rigidly.
+//! Lines stack: a bone listed twice gets both (e.g. breast size + nipple length + lift).
 // ponytail: file polling (100ms) instead of an IPC channel; no Windows crates, raw kernel32 FFI.
 
 use std::collections::HashMap;
@@ -108,6 +113,33 @@ fn scaled(m: &Mat, p: [f32; 3], s: f32) -> Mat {
     o
 }
 
+/// Model-space transform: rotate by `r` degrees (X, then Y, then Z) about `p`, then translate by `t` (row-vector).
+fn xform(p: [f32; 3], r: [f32; 3], t: [f32; 3]) -> Mat {
+    let rot = |axis: usize, deg: f32| -> Mat {
+        let (sn, cs) = deg.to_radians().sin_cos();
+        let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
+        let mut m = [0.0f32; 16];
+        m[axis * 4 + axis] = 1.0; m[15] = 1.0;
+        m[a * 4 + a] = cs; m[a * 4 + b] = sn; m[b * 4 + a] = -sn; m[b * 4 + b] = cs;
+        m
+    };
+    let tr = |v: [f32; 3]| -> Mat {
+        let mut m = [0.0f32; 16];
+        for i in 0..4 { m[i * 4 + i] = 1.0; }
+        m[12] = v[0]; m[13] = v[1]; m[14] = v[2];
+        m
+    };
+    let m = mul(&tr([-p[0], -p[1], -p[2]]), &rot(0, r[0]));
+    let m = mul(&mul(&m, &rot(1, r[1])), &rot(2, r[2]));
+    mul(&mul(&m, &tr(p)), &tr(t))
+}
+
+/// Lift move for one bone: up (model +Z) by forward (+Y) distance from `p0`, capped at `cap`'s, times tan(deg).
+fn lift_x(p0: [f32; 3], pb: [f32; 3], cap: [f32; 3], deg: f32) -> Mat {
+    let d = (pb[1] - p0[1]).min(cap[1] - p0[1]).max(0.0);
+    xform([0.0; 3], [0.0; 3], [0.0, 0.0, d * deg.to_radians().tan()])
+}
+
 // Only meshes listed in the current cmd.txt are live (Lua lists every live heroine mesh, scale 1.0 included).
 // Never write to anything else: an unloaded mesh's matrix array is freed memory the engine reuses
 // (writing "restores" there corrupted a pak decompression buffer -> LowLevelFatalError).
@@ -125,13 +157,34 @@ impl State {
             if f.len() < 5 { continue; }
             let (Ok(mesh), Ok(n), Ok(pivot)) = (
                 usize::from_str_radix(f[0].trim_start_matches("0x"), 16), f[1].parse::<usize>(), f[2].parse::<usize>()) else { continue };
-            let s: Vec<f32> = f[3].split(',').filter_map(|x| x.parse().ok()).collect();
-            if !(s.len() == 1 || s.len() == 3) || s.iter().any(|v| !(0.2..=6.0).contains(v)) || pivot >= n { continue; }
+            let is_x = f[3].starts_with('c');
+            let is_lift = f[3].starts_with('y');
+            let s: Vec<f32> = f[3].trim_start_matches(['c', 'y']).split(',').filter_map(|x| x.parse().ok()).collect();
+            let ok = if is_lift {
+                s.len() == 2 && s[0].abs() <= 45.0 && (s[1] as usize) < n
+            } else if is_x {
+                s.len() == 6 && s[..3].iter().all(|v| v.abs() <= 45.0) && s[3..].iter().all(|v| v.abs() <= 10.0)
+            } else {
+                (s.len() == 1 || s.len() == 3) && s.iter().all(|v| (0.2..=6.0).contains(v))
+            };
+            if !ok || pivot >= n { continue; }
             // ponytail: re-find every apply (only runs when cmd.txt changes); a cached ptr can go stale
             let Some(arr) = find_inv_array(mesh, n) else { continue };
             let mats = unsafe { std::slice::from_raw_parts(arr as *const Mat, n) };
             let po = self.original(arr, pivot, &mats[pivot]);
-            let (p, axes) = (pivot_of(&po), (s.len() == 3).then(|| axis_scaler(&po, [s[0], s[1], s[2]])));
+            let p = pivot_of(&po);
+            if is_lift {
+                let cb = s[1] as usize;
+                let cap = pivot_of(&self.original(arr, cb, &mats[cb]));
+                for b in f[4..].iter().filter_map(|x| x.parse::<usize>().ok()).filter(|&b| b < n) {
+                    let o = self.original(arr, b, &mats[b]);
+                    let cur = *want.get(&(arr, b)).unwrap_or(&o);
+                    want.insert((arr, b), mul(&lift_x(p, pivot_of(&o), cap, s[0]), &cur));
+                }
+                continue;
+            }
+            let axes = if is_x { Some(xform(p, [s[0], s[1], s[2]], [s[3], s[4], s[5]])) }
+                       else { (s.len() == 3).then(|| axis_scaler(&po, [s[0], s[1], s[2]])) };
             for b in f[4..].iter().filter_map(|x| x.parse::<usize>().ok()).filter(|&b| b < n) {
                 let o = self.original(arr, b, &mats[b]);
                 let cur = *want.get(&(arr, b)).unwrap_or(&o);  // stack on earlier lines for this bone
@@ -235,5 +288,30 @@ mod tests {
         // uniform axis scale == the old pivot scale
         let (a, b) = (mul(&axis_scaler(&m, [1.5; 3]), &m), scaled(&m, pivot_of(&m), 1.5));
         assert!(a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-4));
+    }
+    #[test]
+    fn rotate_move() {
+        let m = inv_ref();           // pivot (10,20,30)
+        let p = pivot_of(&m);
+        let near = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-3);
+        // a point 10 cm in front (+Y) of the pivot, turned -90 deg about Z, ends 10 cm to the +X side
+        assert!(near(xf([10.0, 30.0, 30.0], &xform(p, [0.0, 0.0, -90.0], [0.0; 3])), [20.0, 20.0, 30.0]));
+        // +90 about X tips front (+Y) up (+Z): "lift"
+        assert!(near(xf([10.0, 30.0, 30.0], &xform(p, [90.0, 0.0, 0.0], [0.0; 3])), [10.0, 20.0, 40.0]));
+        // the pivot stays, a move just adds
+        assert!(near(xf(p, &xform(p, [10.0, 5.0, 3.0], [1.0, 2.0, 3.0])), [11.0, 22.0, 33.0]));
+    }
+    #[test]
+    fn lift_keeps_tip_direction() {
+        let near = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-3);
+        let (p0, cap) = ([0.0, 0.0, 0.0], [0.0, 10.0, 0.0]);
+        let t45 = 45.0f32;
+        // base bone: no move; a bone 5 cm forward: up 5; the cap and anything past it: up 10, all the same
+        assert!(near(xf([0.0; 3], &lift_x(p0, [0.0, 0.0, 0.0], cap, t45)), [0.0, 0.0, 0.0]));
+        assert!(near(xf([0.0, 5.0, 0.0], &lift_x(p0, [0.0, 5.0, 0.0], cap, t45)), [0.0, 5.0, 5.0]));
+        let tip = lift_x(p0, [0.0, 12.0, 0.0], cap, t45);
+        let (a, b) = (xf([0.0, 12.0, 0.0], &tip), xf([0.0, 13.0, 0.0], &tip));
+        assert!(near([b[0] - a[0], b[1] - a[1], b[2] - a[2]], [0.0, 1.0, 0.0]), "tip still points forward");
+        assert!(near(a, [0.0, 12.0, 10.0]));
     }
 }
